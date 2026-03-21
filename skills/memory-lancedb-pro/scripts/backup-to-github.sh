@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================================
-# 🧠 Memory-LanceDB-Pro 每日 GitHub 备份脚本
-# 版本: v2026.03.20
-# 说明: 导出长期记忆并推送到 GitHub 仓库，支持设置定时任务
+# 🧠 Memory-LanceDB-Pro GitHub 每日备份脚本
+# 版本: v2026.03.21
+# 说明: 导出记忆、生成元数据、推送到 GitHub
 # ============================================================================
 
 set -euo pipefail
@@ -16,14 +16,15 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 # 配置
-BACKUP_DIR="$HOME/.openclaw/memory/backups"
-BACKUP_REPO_DIR="$HOME/.openclaw/memory/backup-repo"
 SCOPE="custom:long-term"
-MAX_LOCAL_BACKUPS=30  # 保留最近 30 天的本地备份
-DATE_TAG=$(date +%Y%m%d)
-BACKUP_FILE="memories-${DATE_TAG}.json"
+BACKUP_DIR="$HOME/.openclaw/memory/backups"
+REPO_DIR="$HOME/.openclaw/memory/backup-repo"
+RETENTION_DAYS=30
+DATE=$(date +%Y%m%d)
+BACKUP_FILE="$BACKUP_DIR/memories-$DATE.json"
+METADATA_FILE="$BACKUP_DIR/metadata-$DATE.json"
 LAUNCHD_LABEL="com.openclaw.memory-backup"
-LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+LAUNCHD_PLIST="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 log_info()  { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -32,34 +33,284 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 # ============================================================================
-# 安装定时任务 (macOS launchd)
+# 显示帮助
 # ============================================================================
-install_schedule() {
-    echo -e "\n${CYAN}📅 设置每日自动备份 (macOS launchd)${NC}\n"
+show_help() {
+    echo "用法: bash backup-to-github.sh [选项]"
+    echo ""
+    echo "选项:"
+    echo "  --init-repo          初始化 GitHub 备份仓库"
+    echo "  --install-schedule   设置每日自动备份（launchd，凌晨 2:00）"
+    echo "  --uninstall-schedule 移除自动备份计划"
+    echo "  --status             查看最近备份状态"
+    echo "  --help, -h           显示帮助"
+    echo ""
+    echo "无参数运行时执行一次备份。"
+}
 
-    if [[ "$(uname)" != "Darwin" ]]; then
-        log_warn "当前系统不是 macOS，请手动设置 cron 定时任务："
-        echo "  crontab -e"
-        echo "  # 每天凌晨 2 点备份"
-        echo "  0 2 * * * $SCRIPT_PATH"
-        return
+# ============================================================================
+# 初始化 GitHub 备份仓库
+# ============================================================================
+init_repo() {
+    echo -e "${CYAN}🔧 初始化 GitHub 备份仓库${NC}"
+    echo ""
+
+    if [ -d "$REPO_DIR/.git" ]; then
+        log_ok "备份仓库已存在: $REPO_DIR"
+        return 0
     fi
 
-    # 创建 LaunchAgents 目录
+    echo "请输入 GitHub 备份仓库地址 (例如: git@github.com:username/memory-backup.git):"
+    read -r REPO_URL
+
+    if [ -z "$REPO_URL" ]; then
+        log_error "仓库地址不能为空"
+        exit 1
+    fi
+
+    mkdir -p "$REPO_DIR"
+
+    # 尝试克隆，如果仓库为空则初始化
+    if git clone "$REPO_URL" "$REPO_DIR" 2>/dev/null; then
+        log_ok "仓库已克隆: $REPO_DIR"
+    else
+        cd "$REPO_DIR"
+        git init
+        git remote add origin "$REPO_URL"
+
+        # 创建初始 README
+        cat > "$REPO_DIR/README.md" << 'README_EOF'
+# 🧠 OpenClaw Memory Backup
+
+本仓库自动备份 OpenClaw memory-lancedb-pro 插件的长期记忆数据。
+
+## 备份内容
+
+- `memories-YYYYMMDD.json` — 当日记忆导出
+- `metadata-YYYYMMDD.json` — 备份元数据（统计信息）
+
+## 恢复
+
+```bash
+openclaw memory-pro import memories-YYYYMMDD.json --scope custom:long-term
+```
+
+---
+
+*由 [memory-lancedb-pro Skill](https://github.com/wansong24/ClawTeam-OpenClaw) 自动生成*
+README_EOF
+
+        git add .
+        git commit -m "🧠 初始化记忆备份仓库"
+        git branch -M main
+        git push -u origin main 2>/dev/null || log_warn "首次推送失败，请确认仓库已创建"
+
+        log_ok "备份仓库初始化完成: $REPO_DIR"
+    fi
+}
+
+# ============================================================================
+# 执行备份
+# ============================================================================
+do_backup() {
+    echo -e "${CYAN}🧠 Memory-LanceDB-Pro 备份 — $DATE${NC}"
+    echo ""
+
+    mkdir -p "$BACKUP_DIR"
+
+    # 1. 导出记忆
+    log_info "导出 scope=$SCOPE 的记忆..."
+
+    if command -v openclaw &>/dev/null; then
+        openclaw memory-pro export --scope "$SCOPE" --output "$BACKUP_FILE" 2>/dev/null || {
+            log_error "记忆导出失败"
+            exit 1
+        }
+    else
+        log_error "openclaw 命令未找到"
+        exit 1
+    fi
+
+    if [ ! -f "$BACKUP_FILE" ]; then
+        log_warn "导出文件为空，可能没有记忆数据"
+        return 0
+    fi
+
+    local file_size
+    file_size=$(wc -c < "$BACKUP_FILE" | tr -d ' ')
+    log_ok "记忆已导出: $BACKUP_FILE ($file_size bytes)"
+
+    # 2. 生成元数据
+    log_info "生成备份元数据..."
+
+    python3 << PYEOF > "$METADATA_FILE"
+import json, sys
+from datetime import datetime
+
+try:
+    with open("$BACKUP_FILE", "r") as f:
+        data = json.load(f)
+
+    memories = data if isinstance(data, list) else data.get("memories", data.get("data", []))
+
+    categories = {}
+    tiers = {}
+    for m in memories:
+        cat = m.get("category", "unknown")
+        categories[cat] = categories.get(cat, 0) + 1
+        tier = m.get("metadata", {}).get("tier", "unknown") if isinstance(m.get("metadata"), dict) else "unknown"
+        tiers[tier] = tiers.get(tier, 0) + 1
+
+    metadata = {
+        "backup_date": "$DATE",
+        "backup_time": datetime.now().isoformat(),
+        "scope": "$SCOPE",
+        "total_memories": len(memories),
+        "categories": categories,
+        "tiers": tiers,
+        "file_size_bytes": $file_size,
+        "version": "v2026.03.21"
+    }
+
+    print(json.dumps(metadata, indent=2, ensure_ascii=False))
+except Exception as e:
+    print(json.dumps({"error": str(e), "backup_date": "$DATE"}))
+PYEOF
+
+    log_ok "元数据已生成: $METADATA_FILE"
+
+    # 显示统计
+    python3 -c "
+import json
+with open('$METADATA_FILE') as f:
+    m = json.load(f)
+print(f'  总记忆数: {m.get(\"total_memories\", \"?\")}')
+cats = m.get('categories', {})
+for k, v in cats.items():
+    print(f'  - {k}: {v}')
+" 2>/dev/null || true
+
+    # 3. 推送到 GitHub
+    if [ -d "$REPO_DIR/.git" ]; then
+        log_info "推送到 GitHub..."
+
+        cp "$BACKUP_FILE" "$REPO_DIR/"
+        cp "$METADATA_FILE" "$REPO_DIR/"
+
+        cd "$REPO_DIR"
+
+        # 如果有变更才提交
+        if git diff --quiet && git diff --cached --quiet && [ -z "$(git ls-files --others --exclude-standard)" ]; then
+            log_ok "记忆无变化，跳过推送"
+        else
+            git add .
+            git commit -m "🧠 记忆备份 $DATE ($(python3 -c "import json; print(json.load(open('$METADATA_FILE')).get('total_memories', '?'))" 2>/dev/null || echo '?') 条记忆)"
+
+            # 推送，失败则 rebase 重试
+            if ! git push 2>/dev/null; then
+                log_warn "推送失败，尝试 pull --rebase 后重试..."
+                git pull --rebase 2>/dev/null && git push 2>/dev/null || {
+                    log_error "推送失败，请手动检查 git 状态"
+                }
+            fi
+
+            log_ok "已推送到 GitHub ✓"
+        fi
+    else
+        log_warn "备份仓库未初始化，仅保留本地备份"
+        log_info "运行 --init-repo 初始化 GitHub 备份仓库"
+    fi
+
+    # 4. 清理旧备份
+    log_info "清理 $RETENTION_DAYS 天前的本地备份..."
+    find "$BACKUP_DIR" -name "memories-*.json" -mtime +$RETENTION_DAYS -delete 2>/dev/null || true
+    find "$BACKUP_DIR" -name "metadata-*.json" -mtime +$RETENTION_DAYS -delete 2>/dev/null || true
+    log_ok "清理完成"
+
+    echo ""
+    echo -e "${GREEN}━━━ 备份完成 ━━━${NC}"
+}
+
+# ============================================================================
+# 查看备份状态
+# ============================================================================
+show_status() {
+    echo -e "${CYAN}🧠 备份状态${NC}"
+    echo ""
+
+    # 最近备份
+    local latest
+    latest=$(ls -t "$BACKUP_DIR"/memories-*.json 2>/dev/null | head -1)
+    if [ -n "$latest" ]; then
+        local latest_date
+        latest_date=$(basename "$latest" | sed 's/memories-//' | sed 's/.json//')
+        local latest_size
+        latest_size=$(wc -c < "$latest" | tr -d ' ')
+        log_ok "最近备份: $latest_date ($latest_size bytes)"
+
+        # 显示元数据
+        local meta="${latest/memories-/metadata-}"
+        if [ -f "$meta" ]; then
+            python3 -c "
+import json
+with open('$meta') as f:
+    m = json.load(f)
+print(f'  记忆总数: {m.get(\"total_memories\", \"?\")}')
+cats = m.get('categories', {})
+for k, v in cats.items():
+    print(f'  - {k}: {v}')
+" 2>/dev/null || true
+        fi
+    else
+        log_warn "没有找到备份文件"
+    fi
+
+    # 备份数量
+    local count
+    count=$(ls "$BACKUP_DIR"/memories-*.json 2>/dev/null | wc -l | tr -d ' ')
+    log_info "本地备份数量: $count (保留 $RETENTION_DAYS 天)"
+
+    # GitHub 状态
+    if [ -d "$REPO_DIR/.git" ]; then
+        cd "$REPO_DIR"
+        local remote
+        remote=$(git remote get-url origin 2>/dev/null || echo "未配置")
+        log_ok "GitHub 仓库: $remote"
+        local last_push
+        last_push=$(git log -1 --format="%ai" 2>/dev/null || echo "未知")
+        log_info "最后推送: $last_push"
+    else
+        log_warn "GitHub 备份仓库未初始化"
+    fi
+
+    # launchd 状态
+    if [ -f "$LAUNCHD_PLIST" ]; then
+        log_ok "自动备份: 已启用 (每日凌晨 2:00)"
+    else
+        log_warn "自动备份: 未启用"
+    fi
+}
+
+# ============================================================================
+# 安装定时备份（launchd）
+# ============================================================================
+install_schedule() {
+    echo -e "${CYAN}🔧 安装每日自动备份${NC}"
+    echo ""
+
     mkdir -p "$HOME/Library/LaunchAgents"
 
-    # 生成 plist
     cat > "$LAUNCHD_PLIST" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>${LAUNCHD_LABEL}</string>
+    <string>$LAUNCHD_LABEL</string>
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>${SCRIPT_PATH}</string>
+        <string>$SCRIPT_PATH</string>
     </array>
     <key>StartCalendarInterval</key>
     <dict>
@@ -69,9 +320,9 @@ install_schedule() {
         <integer>0</integer>
     </dict>
     <key>StandardOutPath</key>
-    <string>${BACKUP_DIR}/backup.log</string>
+    <string>$HOME/.openclaw/memory/backups/backup.log</string>
     <key>StandardErrorPath</key>
-    <string>${BACKUP_DIR}/backup-error.log</string>
+    <string>$HOME/.openclaw/memory/backups/backup-error.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -81,188 +332,45 @@ install_schedule() {
 </plist>
 EOF
 
-    # 加载定时任务
-    launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
-    launchctl load "$LAUNCHD_PLIST"
-
-    log_ok "每日备份定时任务已设置 (每天凌晨 2:00)"
-    log_info "plist 文件: $LAUNCHD_PLIST"
-    log_info "查看状态: launchctl list | grep $LAUNCHD_LABEL"
-    log_info "手动触发: launchctl start $LAUNCHD_LABEL"
-    log_info "卸载: launchctl unload $LAUNCHD_PLIST"
+    launchctl load "$LAUNCHD_PLIST" 2>/dev/null || true
+    log_ok "每日自动备份已安装（凌晨 2:00）"
+    log_info "查看日志: tail -f $BACKUP_DIR/backup.log"
 }
 
 # ============================================================================
-# 初始化 GitHub 备份仓库
+# 卸载定时备份
 # ============================================================================
-init_backup_repo() {
-    if [[ -d "$BACKUP_REPO_DIR/.git" ]]; then
-        return 0
-    fi
-
-    echo -e "\n${CYAN}📦 初始化 GitHub 备份仓库${NC}\n"
-
-    read -p "请输入 GitHub 备份仓库 URL (例如 git@github.com:wansong24/openclaw-memory-backup.git): " REPO_URL
-
-    if [[ -z "$REPO_URL" ]]; then
-        log_error "仓库 URL 不能为空"
-        exit 1
-    fi
-
-    mkdir -p "$BACKUP_REPO_DIR"
-
-    # 尝试 clone 或初始化
-    if git clone "$REPO_URL" "$BACKUP_REPO_DIR" 2>/dev/null; then
-        log_ok "仓库克隆成功"
+uninstall_schedule() {
+    if [ -f "$LAUNCHD_PLIST" ]; then
+        launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
+        rm -f "$LAUNCHD_PLIST"
+        log_ok "自动备份已移除"
     else
-        log_info "仓库不存在或为空，初始化新仓库..."
-        cd "$BACKUP_REPO_DIR"
-        git init
-        git remote add origin "$REPO_URL"
-
-        # 创建 README
-        cat > README.md << 'READMEEOF'
-# 🧠 OpenClaw 长期记忆备份
-
-此仓库由 memory-lancedb-pro 自动维护，用于每日备份 OpenClaw 的长期记忆数据。
-
-## 文件说明
-
-- `memories-YYYYMMDD.json` — 每日记忆快照
-- `latest.json` — 最新记忆数据（符号链接或副本）
-
-## 恢复记忆
-
-```bash
-openclaw memory-pro import memories-YYYYMMDD.json --scope custom:long-term
-```
-
----
-
-*自动生成 — 请勿手动修改*
-READMEEOF
-
-        cat > .gitignore << 'GIEOF'
-.DS_Store
-*.log
-GIEOF
-
-        git add -A
-        git commit -m "🧠 初始化记忆备份仓库"
-
-        # 尝试推送（如果远程仓库已创建）
-        if git push -u origin main 2>/dev/null || git push -u origin master 2>/dev/null; then
-            log_ok "初始推送成功"
-        else
-            log_warn "初始推送跳过 — 请先在 GitHub 上创建仓库: $REPO_URL"
-            log_info "创建后运行: cd $BACKUP_REPO_DIR && git push -u origin main"
-        fi
+        log_warn "自动备份未安装"
     fi
 }
 
 # ============================================================================
-# 执行备份
-# ============================================================================
-do_backup() {
-    echo -e "\n${CYAN}🧠 Memory-LanceDB-Pro 记忆备份 — $(date '+%Y-%m-%d %H:%M:%S')${NC}\n"
-
-    # 确保备份目录存在
-    mkdir -p "$BACKUP_DIR"
-
-    # 步骤 1: 导出记忆
-    log_info "导出记忆 (scope: $SCOPE)..."
-
-    local export_path="$BACKUP_DIR/$BACKUP_FILE"
-
-    if command -v openclaw &>/dev/null; then
-        if openclaw memory-pro export --scope "$SCOPE" --output "$export_path" 2>/dev/null; then
-            local count
-            count=$(python3 -c "import json; print(len(json.load(open('$export_path'))))" 2>/dev/null || echo "?")
-            log_ok "导出完成: $export_path ($count 条记忆)"
-        else
-            log_warn "openclaw memory-pro export 失败，尝试直接复制 LanceDB 数据..."
-            local db_path="$HOME/.openclaw/memory/lancedb-longterm"
-            if [[ -d "$db_path" ]]; then
-                cp -r "$db_path" "$BACKUP_DIR/lancedb-snapshot-${DATE_TAG}"
-                log_ok "LanceDB 快照已保存"
-            else
-                log_error "无法导出记忆，数据库路径不存在: $db_path"
-                return 1
-            fi
-        fi
-    else
-        log_error "openclaw 命令未找到"
-        return 1
-    fi
-
-    # 步骤 2: 推送到 GitHub
-    if [[ -d "$BACKUP_REPO_DIR/.git" ]]; then
-        log_info "推送备份到 GitHub..."
-
-        # 复制备份文件到仓库
-        cp "$export_path" "$BACKUP_REPO_DIR/" 2>/dev/null || true
-        cp "$export_path" "$BACKUP_REPO_DIR/latest.json" 2>/dev/null || true
-
-        cd "$BACKUP_REPO_DIR"
-
-        # 检查是否有变化
-        if git diff --quiet && git diff --staged --quiet && [[ -z "$(git ls-files --others --exclude-standard)" ]]; then
-            log_info "记忆未发生变化，跳过推送"
-        else
-            git add -A
-            git commit -m "🧠 记忆备份 $(date '+%Y-%m-%d %H:%M')" --quiet
-            if git push --quiet 2>/dev/null; then
-                log_ok "备份已推送到 GitHub"
-            else
-                log_warn "推送失败 — 请检查网络连接和仓库权限"
-            fi
-        fi
-    else
-        log_warn "GitHub 备份仓库未初始化"
-        log_info "运行: $SCRIPT_PATH --init-repo 初始化"
-    fi
-
-    # 步骤 3: 清理旧备份
-    log_info "清理超过 $MAX_LOCAL_BACKUPS 天的本地备份..."
-    local cleaned=0
-    while IFS= read -r old_file; do
-        rm -f "$old_file"
-        cleaned=$((cleaned + 1))
-    done < <(find "$BACKUP_DIR" -name "memories-*.json" -mtime +$MAX_LOCAL_BACKUPS 2>/dev/null || true)
-
-    if [[ $cleaned -gt 0 ]]; then
-        log_ok "已清理 $cleaned 个旧备份文件"
-    fi
-
-    echo ""
-    log_ok "备份完成! ✅"
-}
-
-# ============================================================================
-# 主流程
+# 主入口
 # ============================================================================
 main() {
     case "${1:-}" in
+        --init-repo)
+            init_repo
+            ;;
         --install-schedule)
             install_schedule
             ;;
-        --init-repo)
-            init_backup_repo
+        --uninstall-schedule)
+            uninstall_schedule
+            ;;
+        --status)
+            show_status
             ;;
         --help|-h)
-            echo "用法: $(basename "$0") [选项]"
-            echo ""
-            echo "选项:"
-            echo "  (无参数)           执行记忆备份"
-            echo "  --install-schedule 设置每日自动备份定时任务"
-            echo "  --init-repo        初始化 GitHub 备份仓库"
-            echo "  --help             显示此帮助信息"
+            show_help
             ;;
         *)
-            # 如果备份仓库未初始化，先初始化
-            if [[ ! -d "$BACKUP_REPO_DIR/.git" ]]; then
-                init_backup_repo
-            fi
             do_backup
             ;;
     esac
